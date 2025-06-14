@@ -190,44 +190,63 @@ def main():
 
 
 def generate_content(client, messages, verbose):
-    max_retries = 3
-    base_delay = 1.0
+    max_iterations = 20
 
-    for attempt in range(max_retries):
-        try:
-            response = client.models.generate_content(
-                model="gemini-2.0-flash-001",
-                contents=messages,
-                config=types.GenerateContentConfig(
-                    tools=[available_functions], system_instruction=system_prompt
-                ),
-            )
-            break
-        except errors.ServerError as e:
-            error_str = str(e)
-            is_retryable = (
-                ("503" in error_str and ("overloaded" in error_str or "UNAVAILABLE" in error_str)) or
-                ("429" in error_str) or  # Rate limit exceeded
-                ("502" in error_str) or  # Bad gateway
-                ("504" in error_str)     # Gateway timeout
-            )
-            if is_retryable and attempt < max_retries - 1:
-                delay = base_delay * (2 ** attempt)
-                if verbose:
-                    print(f"API temporarily unavailable, retrying in {delay:.1f} seconds... (attempt {attempt + 1}/{max_retries})")
-                time.sleep(delay)
-                continue
-            else:
-                raise
-    if verbose:
-        print("Prompt tokens:", response.usage_metadata.prompt_token_count)
-        print("Response tokens:", response.usage_metadata.candidates_token_count)
+    for iteration in range(max_iterations):
+        max_retries = 3
+        base_delay = 1.0
 
-    # Check for function calls in the response
-    if response.candidates and response.candidates[0].content.parts:
-        for part in response.candidates[0].content.parts:
-            if hasattr(part, 'function_call') and part.function_call:
-                function_call_result = call_function(part.function_call, verbose)
+        # Retry logic for API calls
+        for attempt in range(max_retries):
+            try:
+                response = client.models.generate_content(
+                    model="gemini-2.0-flash-001",
+                    contents=messages,
+                    config=types.GenerateContentConfig(
+                        tools=[available_functions], system_instruction=system_prompt
+                    ),
+                )
+                break
+            except errors.ServerError as e:
+                error_str = str(e)
+                is_retryable = (
+                    ("503" in error_str and ("overloaded" in error_str or "UNAVAILABLE" in error_str)) or
+                    ("429" in error_str) or  # Rate limit exceeded
+                    ("502" in error_str) or  # Bad gateway
+                    ("504" in error_str)     # Gateway timeout
+                )
+                if is_retryable and attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    if verbose:
+                        print(f"API temporarily unavailable, retrying in {delay:.1f} seconds... (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(delay)
+                    continue
+                else:
+                    raise
+
+        if verbose:
+            print("Prompt tokens:", response.usage_metadata.prompt_token_count)
+            print("Response tokens:", response.usage_metadata.candidates_token_count)
+
+        # Add candidates' content to messages and check for function calls
+        function_called = False
+        function_call_parts = []
+
+        for candidate in response.candidates:
+            messages.append(candidate.content)
+
+            # Check for function calls in this candidate
+            if candidate.content.parts:
+                for part in candidate.content.parts:
+                    if hasattr(part, 'function_call') and part.function_call:
+                        function_called = True
+                        function_call_parts.append(part.function_call)
+
+        # If function calls were made, execute them all and create a single response
+        if function_call_parts:
+            function_response_parts = []
+            for function_call in function_call_parts:
+                function_call_result = call_function(function_call, verbose)
 
                 # Check if function_call_result has the expected structure
                 if not hasattr(function_call_result, 'parts') or not function_call_result.parts:
@@ -237,22 +256,28 @@ def generate_content(client, messages, verbose):
                 if not hasattr(function_call_result.parts[0].function_response, 'response'):
                     raise Exception("Function call result missing response")
 
-                response_data = function_call_result.parts[0].function_response.response
-                if verbose:
-                    print(f"-> {response_data}")
-                else:
-                    # Show the actual result in non-verbose mode too
-                    if 'result' in response_data:
-                        print(response_data['result'])
-                    elif 'error' in response_data:
-                        print(f"Error: {response_data['error']}")
+                function_response_parts.extend(function_call_result.parts)
 
-            elif hasattr(part, 'text') and part.text:
-                print("Response:")
-                print(part.text)
-    else:
-        print("Response:")
-        print(response.text)
+            # Create a single message with all function responses
+            combined_response = types.Content(
+                role="tool",
+                parts=function_response_parts
+            )
+            messages.append(combined_response)
+
+        # If no function was called, print final response and break
+        if not function_called:
+            # Print the final response text
+            if response.candidates and response.candidates[0].content.parts:
+                for part in response.candidates[0].content.parts:
+                    if hasattr(part, 'text') and part.text:
+                        print("Final response:")
+                        print(part.text)
+                        break
+            else:
+                print("Final response:")
+                print(response.text)
+            break
 
 
 if __name__ == "__main__":
